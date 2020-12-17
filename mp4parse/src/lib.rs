@@ -3,7 +3,6 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 #[macro_use]
 extern crate log;
 
@@ -13,7 +12,6 @@ extern crate fallible_collections;
 extern crate num_traits;
 use bitreader::{BitReader, ReadInto};
 use byteorder::{ReadBytesExt, WriteBytesExt};
-
 use fallible_collections::TryRead;
 use fallible_collections::TryReserveError;
 use num_traits::Num;
@@ -1182,6 +1180,14 @@ struct BMFFBox<'a, T: 'a> {
     content: Take<&'a mut T>,
 }
 
+impl<T> BMFFBox<'_, T> {
+    /// The value in `self.content.limit()` comes from the file itself, so it's
+    /// possible for invalid files to drastically overstate the size of a box,
+    /// triggering a massive, unnecessary allocation. To avoid this, we limit
+    /// the size of a single read in BMFFBox's TryRead::try_read_to_end impl.
+    const MAX_READ_CHUNK_BYTES: u64 = 128 * 1024 * 1024;
+}
+
 struct BoxIter<'a, T: 'a> {
     src: &'a mut T,
 }
@@ -1212,7 +1218,20 @@ impl<'a, T: Read> Read for BMFFBox<'a, T> {
 
 impl<'a, T: Read> TryRead for BMFFBox<'a, T> {
     fn try_read_to_end(&mut self, buf: &mut TryVec<u8>) -> std::io::Result<usize> {
-        fallible_collections::try_read_up_to(self, self.bytes_left(), buf)
+        let mut total_bytes_read: usize = 0;
+
+        while total_bytes_read.to_u64() < self.bytes_left() {
+            let chunk = std::cmp::min(self.bytes_left(), Self::MAX_READ_CHUNK_BYTES);
+            let bytes_read = fallible_collections::try_read_up_to(self, chunk, buf)?;
+            total_bytes_read += bytes_read;
+            if bytes_read.to_u64() < chunk {
+                // A short read from try_read_up_to implies the length of the
+                // box in the file was incorrect
+                break;
+            }
+        }
+
+        Ok(total_bytes_read)
     }
 }
 
